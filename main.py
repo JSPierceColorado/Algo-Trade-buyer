@@ -19,10 +19,14 @@ ALPACA_SECRET_KEY  = os.getenv("ALPACA_SECRET_KEY") or os.getenv("APCA_API_SECRE
 APCA_API_BASE_URL  = os.getenv("APCA_API_BASE_URL", "https://api.alpaca.markets")  # live by default
 
 # Buy 5% of available buying power per symbol
-PERCENT_PER_TRADE  = float(os.getenv("PERCENT_PER_TRADE", "5.0"))  # percent
-MIN_ORDER_NOTIONAL = float(os.getenv("MIN_ORDER_NOTIONAL", "1.00"))  # fallback floor
-SLEEP_BETWEEN_ORDERS_SEC = float(os.getenv("SLEEP_BETWEEN_ORDERS_SEC", "0.5"))
-EXTENDED_HOURS = os.getenv("EXTENDED_HOURS", "false").lower() in ("1", "true", "yes")
+PERCENT_PER_TRADE       = float(os.getenv("PERCENT_PER_TRADE", "5.0"))   # percent
+MIN_ORDER_NOTIONAL      = float(os.getenv("MIN_ORDER_NOTIONAL", "1.00"))  # floor
+SLEEP_BETWEEN_ORDERS_SEC= float(os.getenv("SLEEP_BETWEEN_ORDERS_SEC", "0.5"))
+EXTENDED_HOURS          = os.getenv("EXTENDED_HOURS", "false").lower() in ("1", "true", "yes")
+
+# Sheet layout anchors
+LOG_HEADERS     = ["Timestamp","Action","Symbol","NotionalUSD","Qty","OrderID","Status","Note"]
+LOG_TABLE_RANGE = "A1:H1"
 
 
 # =========================
@@ -48,10 +52,50 @@ def _get_ws(gc, sheet_name, tab):
         return sh.add_worksheet(title=tab, rows="2000", cols="50")
 
 
+def ensure_log(ws):
+    """Ensure header is exactly in A1:H1 and frozen; prevents offset drift."""
+    vals = ws.get_values("A1:H1")
+    if not vals or vals[0] != LOG_HEADERS:
+        ws.update("A1:H1", [LOG_HEADERS])
+    try:
+        ws.freeze(rows=1)
+    except Exception:
+        pass
+
+
+def append_logs(ws, rows):
+    """
+    Append logs anchored to A1:H1, forcing exactly 8 columns per row.
+    This avoids Sheets creating a separate 'table' off to the right.
+    """
+    if not rows:
+        return
+    fixed = []
+    for r in rows:
+        if len(r) < 8:
+            r = r + [""] * (8 - len(r))
+        elif len(r) > 8:
+            r = r[:8]
+        fixed.append(r)
+    try:
+        # Anchor appends to our table
+        for i in range(0, len(fixed), 100):
+            ws.append_rows(
+                fixed[i:i+100],
+                value_input_option="RAW",     # avoid locale/date auto-parsing
+                table_range=LOG_TABLE_RANGE   # <<< anchor prevents offset
+            )
+    except TypeError:
+        # Fallback for older gspread without table_range support
+        start_row = len(ws.get_all_values()) + 1
+        end_row = start_row + len(fixed) - 1
+        ws.update(f"A{start_row}:H{end_row}", fixed, value_input_option="RAW")
+
+
 def read_screener_tickers(ws):
     """
     Reads the screener tab and returns a list of tickers.
-    Assumes a header row containing a column named 'Ticker'.
+    Assumes a header row containing a column named 'Ticker'; falls back to first col.
     """
     values = ws.get_all_values()
     if not values:
@@ -61,7 +105,6 @@ def read_screener_tickers(ws):
     try:
         idx = header.index("Ticker")
     except ValueError:
-        # Fallback: assume first column
         idx = 0
 
     tickers = []
@@ -71,7 +114,7 @@ def read_screener_tickers(ws):
             if t:
                 tickers.append(t)
 
-    # Preserve order but remove dups while keeping first occurrence
+    # Preserve order while de-duping
     seen = set()
     ordered = []
     for t in tickers:
@@ -79,21 +122,6 @@ def read_screener_tickers(ws):
             seen.add(t)
             ordered.append(t)
     return ordered
-
-
-def append_logs(ws, rows):
-    """
-    rows: List[List[Any]] to append to LOG_TAB.
-    """
-    if not rows:
-        return
-    # Ensure a basic header exists (idempotent-ish)
-    existing = ws.get_all_values()
-    if not existing:
-        ws.append_row(["Timestamp", "Action", "Symbol", "NotionalUSD", "Qty", "OrderID", "Status", "Note"])
-    # Append in batches
-    for i in range(0, len(rows), 100):
-        ws.append_rows(rows[i:i+100], value_input_option="USER_ENTERED")
 
 
 def make_alpaca():
@@ -105,9 +133,9 @@ def make_alpaca():
 def place_buy_notional(api: REST, symbol: str, notional: float, extended: bool):
     """
     Places a market buy with notional dollars. Returns the order object.
-    This intentionally ignores existing positions and open orders (per requirements).
+    Adds an idempotent client_order_id so retries won't double-buy.
     """
-    # Alpaca expects strings for some numeric fields; floats are okay too.
+    client_order_id = f"buy-{symbol}-{int(time.time()*1000)}"
     order = api.submit_order(
         symbol=symbol,
         side="buy",
@@ -115,6 +143,7 @@ def place_buy_notional(api: REST, symbol: str, notional: float, extended: bool):
         time_in_force="day",
         notional=round(notional, 2),
         extended_hours=extended,
+        client_order_id=client_order_id,
     )
     return order
 
@@ -126,12 +155,12 @@ def main():
     print("🚀 Buy bot starting")
 
     # Connect
-    gc = get_google_client()
+    gc  = get_google_client()
     api = make_alpaca()
 
     # Sheets
     screener_ws = _get_ws(gc, SHEET_NAME, SCREENER_TAB)
-    log_ws = _get_ws(gc, SHEET_NAME, LOG_TAB)
+    log_ws      = _get_ws(gc, SHEET_NAME, LOG_TAB); ensure_log(log_ws)
 
     # Read symbols to buy
     symbols = read_screener_tickers(screener_ws)
@@ -145,7 +174,7 @@ def main():
         try:
             # Refresh account each time so we never overspend
             acct = api.get_account()
-            # Depending on account type/margin setting, use buying_power; fall back to cash
+            # Use buying_power; fall back to cash if not present
             try:
                 buying_power = float(acct.buying_power)
             except Exception:
@@ -153,15 +182,15 @@ def main():
 
             notional = buying_power * (PERCENT_PER_TRADE / 100.0)
             if notional < MIN_ORDER_NOTIONAL:
-                note = f"Skipped: notional {notional:.2f} < MIN_ORDER_NOTIONAL {MIN_ORDER_NOTIONAL:.2f}"
+                note = f"Notional {notional:.2f} < MIN_ORDER_NOTIONAL {MIN_ORDER_NOTIONAL:.2f}"
                 print(f"⚠️ {symbol} {note}")
                 logs.append([now_iso_utc(), "BUY-SKIP", symbol, f"{notional:.2f}", "", "", "SKIPPED", note])
                 continue
 
             order = place_buy_notional(api, symbol, notional, EXTENDED_HOURS)
-            qty = getattr(order, "qty", "") or ""  # may be empty for notional before fill
+            qty    = getattr(order, "qty", "") or ""   # may be empty pre-fill for notional
             status = getattr(order, "status", "submitted")
-            oid = getattr(order, "id", "")
+            oid    = getattr(order, "id", "")
 
             print(f"✅ Submitted BUY {symbol} ${notional:.2f} (order {oid}, status {status})")
 
@@ -173,7 +202,7 @@ def main():
             print(f"❌ {symbol} {msg}")
             logs.append([now_iso_utc(), "BUY-ERROR", symbol, "", "", "", "ERROR", msg])
 
-    # Write logs
+    # Write logs (anchored)
     append_logs(log_ws, logs)
     print("✅ Buy cycle complete")
 
